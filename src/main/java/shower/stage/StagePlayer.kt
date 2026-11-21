@@ -18,6 +18,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlin.coroutines.resume
@@ -37,7 +38,7 @@ class StagePlayer(
     photoLayer: FrameLayout,
     overlay: View,
     statusText: TextView
-) {
+) : Playback {
     private val appView = view
     private val glView = glView
     private val photoLayer = photoLayer
@@ -70,18 +71,12 @@ class StagePlayer(
     /** Хост получает битый элемент (skip-on-error: решает — блокировать/пропустить). */
     var errorDelegate: ((StageItem) -> Unit)? = null
 
-    /** Последний элемент, реально отданный в воспроизведение. */
-    var lastPlayed: StageItem? = null
-        private set
-
     /** Относительно чего продолжить прерванный ран. */
     data class ResumeMark(val idx: Int, val posMs: Long)
 
-    private data class VideoMark(val relPaths: List<String>, val idx: Int, val posMs: Long)
-    private data class PhotoMark(val relPaths: List<String>, val idx: Int)
+    private data class Mark(val relPaths: List<String>, val idx: Int, val posMs: Long)
 
-    private var videoBookmark: VideoMark? = null
-    private var photoBookmark: PhotoMark? = null
+    private var bookmark: Mark? = null
     // «живое» состояние активного рана — читается при pause() до снесения плееров (всё на main-треде)
     private var playRelPaths: List<String>? = null
     private var playCrossfade = true
@@ -152,14 +147,14 @@ class StagePlayer(
             StageLog.i("resume bookmark: ран доигрывается — закладки нет")
             return
         }
-        videoBookmark = VideoMark(paths, idx, posMs)
+        bookmark = Mark(paths, idx, posMs)
         StageLog.i("resume bookmark: video idx=$idx pos=${posMs}ms of ${paths.size}")
     }
 
     private fun capturePhotoBookmark() {
         val paths = photoRelPaths ?: return
         val idx = photoIdx.coerceIn(0, paths.size - 1)
-        photoBookmark = PhotoMark(paths, idx)
+        bookmark = Mark(paths, idx, 0L)
         StageLog.i("resume bookmark: photo idx=$idx of ${paths.size}")
     }
 
@@ -167,27 +162,15 @@ class StagePlayer(
      * Насос перед стартом рана: вернуть закладку, если ран тот же (сверка relPathов),
      * и погасить её. Вернуть null — старт с начала.
      */
-    fun takeVideoBookmark(expected: List<String>): ResumeMark? {
-        val b = videoBookmark ?: return null
-        videoBookmark = null
+    private fun takeMark(expected: List<String>): ResumeMark? {
+        val b = bookmark ?: return null
+        bookmark = null
         if (b.relPaths.size != expected.size || b.relPaths.zip(expected).any { (a, e) -> a != e }) {
             StageLog.i("resume bookmark: список изменился — старт с начала")
             return null
         }
         StageLog.i("resume bookmark: продолжаю с idx=${b.idx} pos=${b.posMs}ms of ${b.relPaths.size}")
         return ResumeMark(b.idx, b.posMs)
-    }
-
-    /** Аналогично [takeVideoBookmark] для фото-ранов: вернуть стартовый индекс или null. */
-    fun takePhotoBookmark(expected: List<String>): Int? {
-        val b = photoBookmark ?: return null
-        photoBookmark = null
-        if (b.relPaths.size != expected.size || b.relPaths.zip(expected).any { (a, e) -> a != e }) {
-            StageLog.i("resume bookmark photo: список изменился — старт с начала")
-            return null
-        }
-        StageLog.i("resume bookmark: продолжаю photo с idx=${b.idx} of ${b.relPaths.size}")
-        return b.idx
     }
 
     private fun resolveStart(items: List<StageItem>, mark: ResumeMark?): Pair<Int, Long> =
@@ -233,10 +216,6 @@ class StagePlayer(
     }
 
     private fun baseVolume(): Float = if (videoMute) 0f else 1f
-
-    private fun hideAmbient() {
-        glView?.visibility = View.GONE
-    }
 
     private fun ensurePhotoLayer(): PhotoSink {
         if (sink == null) {
@@ -320,10 +299,10 @@ class StagePlayer(
     }
 
     /** Плавно затемнить маской до 100%. */
-    suspend fun fadeOut() = animateTo(1f)
+    override suspend fun fadeOut() = animateTo(1f)
 
     /** Плавно убрать маску до 0%. */
-    suspend fun fadeIn() = animateTo(0f)
+    override suspend fun fadeIn() = animateTo(0f)
 
     private suspend fun animateTo(alpha: Float) {
         overlayBlack.animate().cancel()
@@ -345,6 +324,32 @@ class StagePlayer(
         }
     }
 
+    // ============================ контракт Playback ============================
+
+    /** Тип последнего запущенного рана — для [awaitRunEnd]. */
+    private var lastWasVideo = true
+
+    override fun isPaused(): Boolean = paused
+
+    override suspend fun playVideo(items: List<StageItem>, crossfade: Boolean) {
+        lastWasVideo = true
+        val mark = takeMark(items.map { it.relPath })
+        startVideoRun(items, crossfade, mark)
+    }
+
+    override suspend fun playPhoto(items: List<StageItem>, slideMs: Long) {
+        lastWasVideo = false
+        val mark = takeMark(items.map { it.relPath })
+        startPhotoRun(items, slideMs, mark?.idx ?: 0)
+    }
+
+    override suspend fun awaitRunEnd() {
+        if (lastWasVideo) awaitVideoRunEnd() else awaitPhotoRunEnd()
+    }
+
+    /** Погасить текущий ран: отменить endJob (awaitRunEnd вернётся сразу) и остановить плееры. */
+    override fun stop() = stopAll()
+
     // ============================ VIDEO ============================
 
     /**
@@ -353,7 +358,7 @@ class StagePlayer(
      * false — hard-cut одним списком MediaItems.
      * @param resumeMark продолжить прерванный ран с item[idx] posMs (закладка после HOME).
      */
-    suspend fun startVideoRun(run: Run.VideoRun, crossfade: Boolean, resumeMark: ResumeMark? = null) {
+    suspend fun startVideoRun(items: List<StageItem>, crossfade: Boolean, resumeMark: ResumeMark? = null) {
         if (paused) {
             StageLog.i("startVideoRun ignored: paused")
             return
@@ -371,60 +376,55 @@ class StagePlayer(
         val p = s.player ?: return
         glView?.startRendering()
 
-        val items = run.items
         if (items.isEmpty()) return
         playRelPaths = items.map { it.relPath }
         playCrossfade = crossfade
-
         p.volume = baseVolume()
 
-        if (!crossfade || items.size <= 1) {
-            // videoFade=none: поведение как раньше — список MediaItems, hard-cut стыки
-            val msm = items.map { MediaItem.fromUri(it.uri) }
-            val (startIdx, startPos) = resolveStart(items, resumeMark)
-            if (startIdx > 0 || startPos > 0) {
-                p.setMediaItems(msm, startIdx, startPos)
-            } else {
-                p.setMediaItems(msm)
-            }
-            p.prepare()
-            p.playWhenReady = true
-            awaitFirstFrame(p)
-            if (paused) { stopSlot(s); return }
-            if (p.playerError != null) {
-                val bad = items.getOrNull(p.currentMediaItemIndex) ?: items.first()
-                StageLog.w("player error item ${bad.relPath} code=${p.playerError?.errorCodeName}")
-                errorDelegate?.invoke(bad)
-                stopSlot(s)
-                return
-            }
-            endJob = scope.launch {
-                try {
-                    val end = awaitRunEnd(p, items)
-                    if (end != null) lastPlayed = end
-                    stopSlot(s)
-                } finally { playRelPaths = null }
-            }
+        val (startIdx, startPos) = resolveStart(items, resumeMark)
+        val useCrossfade = crossfade && items.size > 1
+        if (useCrossfade) {
+            p.setMediaItem(MediaItem.fromUri(items[startIdx].uri), startPos)
         } else {
-            // crossfade: активный плеер играет ОДИН MediaItem, стыки ведёт driveVideoRun
-            val (startIdx, startPosRaw) = resolveStart(items, resumeMark)
-            p.setMediaItem(MediaItem.fromUri(items[startIdx].uri), startPosRaw)
-            p.prepare()
-            p.playWhenReady = true
+            val msm = items.map { MediaItem.fromUri(it.uri) }
+            if (startIdx > 0 || startPos > 0) p.setMediaItems(msm, startIdx, startPos) else p.setMediaItems(msm)
+        }
+        p.prepare()
+        p.playWhenReady = true
+        try {
             awaitFirstFrame(p)
-            if (paused) { stopSlot(s); return }
-            var startPos = startPosRaw
+        } catch (t: java.io.IOException) {
+            StageLog.w("first frame timeout: ${items[startIdx].relPath} — слайд битый для этой сессии")
+            errorDelegate?.invoke(items[startIdx])
+            stopSlot(s)
+            return
+        }
+        if (p.playbackState == Player.STATE_IDLE) { stopSlot(s); return } // stop() во время загрузки — не блэклист
+        if (paused) { stopSlot(s); return }
+        if (p.playerError != null) {
+            val bad = items.getOrNull(p.currentMediaItemIndex) ?: items.first()
+            StageLog.w("player error item ${bad.relPath} code=${p.playerError?.errorCodeName}")
+            errorDelegate?.invoke(bad)
+            stopSlot(s)
+            return
+        }
+        if (useCrossfade) {
+            var pos = startPos
             val dur = p.duration
-            if (dur > 0 && startPos >= dur) { // ролик кончился за время паузы — отступаем к стыку
-                startPos = (dur - 1000).coerceAtLeast(0)
-                p.seekTo(startPos)
+            if (dur > 0 && pos >= dur) { // ролик кончился за время паузы — отступаем к стыку
+                pos = (dur - 1000).coerceAtLeast(0)
+                p.seekTo(pos)
             }
-            lastPlayed = items[startIdx]
             playIdx = startIdx
             playSlot = 0
             endJob = scope.launch {
-                try { driveVideoRun(run, startIdx) }
+                try { driveVideoRun(items, startIdx) }
                 finally { playRelPaths = null; fadeTargetIdx = -1 }
+            }
+        } else {
+            endJob = scope.launch {
+                try { awaitRunEnd(p, items); stopSlot(s) }
+                finally { playRelPaths = null }
             }
         }
     }
@@ -446,8 +446,7 @@ class StagePlayer(
      * Кроссфейд-ран: активный плеер играет ОДИН MediaItem; за transitionMs до конца
      * готовит другой слот с следующим роликом и смешивает картинки (GL fade) + звук.
      */
-    private suspend fun driveVideoRun(run: Run.VideoRun, startIdx: Int) {
-        val items = run.items
+    private suspend fun driveVideoRun(items: List<StageItem>, startIdx: Int) {
         if (items.isEmpty()) return
         var slotIdx = 0
         var idx = startIdx
@@ -483,7 +482,6 @@ class StagePlayer(
                 p.volume = baseVolume()
                 loaded = true
             }
-            lastPlayed = items[idx]
             playIdx = idx
             playSlot = slotIdx
 
@@ -493,6 +491,8 @@ class StagePlayer(
                 if (p.playerError != null) { boundary = B_ERROR; break }
                 if (p.playbackState == Player.STATE_ENDED) { boundary = B_ENDED; break }
                 val dur = p.duration
+                // EOS может не прийти от OMX (AM3): позиция дошла до конца → считаем ended
+                if (dur > 0 && p.currentPosition >= dur) { boundary = B_ENDED; break }
                 if (idx + 1 < items.size && dur > 0 && dur - p.currentPosition <= transitionMs) {
                     boundary = B_NEAR_END; break
                 }
@@ -538,12 +538,20 @@ class StagePlayer(
         const val B_NEAR_END = 2
         const val PREP_OK = 0
         const val PREP_ERROR = 1
+
+        /** Glide может не вернуть ни одного колбэка — не ждём дольше (AM3, file:// с кириллицей). */
+        const val PHOTO_LOAD_TIMEOUT_MS = 15000L
+
+        /** READY не приходит после серии стоп/стартов (AM3/OMX) — не ждём дольше. */
+        const val FIRST_FRAME_TIMEOUT_MS = 10000L
     }
 
     /** Ждёт STATE_ENDED или ошибку (без переключений) — для «всё битое, играть текущий до конца». */
     private suspend fun awaitEndedOnly(p: ExoPlayer) {
         while (true) {
             if (p.playerError != null || p.playbackState == Player.STATE_ENDED || paused) return
+            val dur = p.duration
+            if (dur > 0 && p.currentPosition >= dur) return // EOS может не прийти (AM3)
             delay(100)
         }
     }
@@ -670,7 +678,7 @@ class StagePlayer(
      * @param slideMs длительность слайда решает хост/директор.
      * @param startIdx стартовый слайд (закладка после HOME).
      */
-    suspend fun startPhotoRun(run: Run.PhotoRun, slideMs: Long, startIdx: Int = 0) {
+    suspend fun startPhotoRun(items: List<StageItem>, slideMs: Long, startIdx: Int = 0) {
         if (paused) {
             StageLog.i("startPhotoRun ignored: paused")
             return
@@ -679,18 +687,17 @@ class StagePlayer(
         val s = sink!!
         photoLayer.visibility = View.VISIBLE
         appView.visibility = View.GONE
-        hideAmbient()
+        glView?.visibility = View.GONE
         overlayBlack.visibility = View.VISIBLE
 
-        val start = startIdx.coerceIn(0, run.items.size - 1)
-        val first = run.items.getOrNull(start) ?: return
-        photoRelPaths = run.items.map { it.relPath }
+        val start = startIdx.coerceIn(0, items.size - 1)
+        val first = items.getOrNull(start) ?: return
+        photoRelPaths = items.map { it.relPath }
         photoIdx = start
         showSlide(s, first, crossfade = false)
-        lastPlayed = first
 
         endJob = scope.launch {
-            try { playRestSlides(run, slideMs, start) }
+            try { playRestSlides(items, slideMs, start) }
             finally { photoRelPaths = null }
         }
     }
@@ -701,62 +708,84 @@ class StagePlayer(
         endJob = null
     }
 
-    private suspend fun playRestSlides(run: Run.PhotoRun, slideMsIn: Long, startIdx: Int) {
+    private suspend fun playRestSlides(items: List<StageItem>, slideMsIn: Long, startIdx: Int) {
         val s = sink ?: return
         val fadeMs = minOf(transitionMs, 600L)
         val slideMs = slideMsIn.coerceAtLeast(1000L)
-        if (startIdx < run.items.size) delay(slideMs) // слайд startIdx уже показан startPhotoRun'ом
-        for (i in (startIdx + 1) until run.items.size) {
+        if (startIdx < items.size) delay(slideMs) // слайд startIdx уже показан startPhotoRun'ом
+        for (i in (startIdx + 1) until items.size) {
             if (paused) return
-            val it = run.items[i]
             photoIdx = i
-            showSlide(s, it, crossfade = true)
-            lastPlayed = it
-            if (i != run.items.size - 1) delay(slideMs - fadeMs)
+            showSlide(s, items[i], crossfade = true)
+            delay(slideMs - fadeMs) // и последний слайд — до фейда следующего рана
         }
     }
 
     private suspend fun showSlide(s: PhotoSink, item: StageItem, crossfade: Boolean) {
+        StageLog.i("photo load start: ${item.relPath}")
         val gr = Glide.with(appView.context)
         val fadeMs = minOf(transitionMs, 600L)
         val img = s.back
-        java.util.concurrent.atomic.AtomicBoolean(false).let { done ->
-            suspendCancellableCoroutine<Unit> { cont ->
-                fun settle() {
-                    if (done.compareAndSet(false, true)) cont.resume(Unit)
-                }
-                cont.invokeOnCancellation { runCatching { Glide.with(appView.context).clear(img) } }
-                gr.load(item.uri)
-                    .listener(object : com.bumptech.glide.request.RequestListener<android.graphics.drawable.Drawable> {
-                        override fun onLoadFailed(e: GlideException?, model: Any?, target: com.bumptech.glide.request.target.Target<android.graphics.drawable.Drawable>, isFirstResource: Boolean): Boolean {
-                            StageLog.w("photo load failed: ${item.relPath} ${e?.message}")
-                            errorDelegate?.invoke(item)
-                            settle()
-                            return true
-                        }
 
-                        override fun onResourceReady(resource: android.graphics.drawable.Drawable, model: Any, target: com.bumptech.glide.request.target.Target<android.graphics.drawable.Drawable>, dataSource: com.bumptech.glide.load.DataSource, isFirstResource: Boolean): Boolean {
-                            settle()
-                            return false
-                        }
-                    })
-                    .into(img)
-            }
-        }
+        // СНАЧАЛА прикрепляем слой (alpha=0): Glide.into до attach оставляет запрос
+        // незапущенным на detach и он может никогда не завершиться (воспроизведено на AM3)
         img.alpha = 0f
         s.layer.removeView(img)
         s.layer.addView(img, FrameLayout.LayoutParams(-1, -1))
+
+        // таймаут: Glide может не дать НИ ОДНОГО колбэка —
+        // зависание навсегда = чёрный экран; по таймауту пропускаем слайд
+        val loaded = kotlinx.coroutines.withTimeoutOrNull(PHOTO_LOAD_TIMEOUT_MS) {
+            java.util.concurrent.atomic.AtomicBoolean(false).let { done ->
+                suspendCancellableCoroutine<Unit> { cont ->
+                    fun settle() {
+                        if (done.compareAndSet(false, true)) cont.resume(Unit)
+                    }
+                    cont.invokeOnCancellation { runCatching { Glide.with(appView.context).clear(img) } }
+                    runCatching { gr.clear(img) } // гасим возможный застрявший запрос на этом view
+                    gr.load(item.uri)
+                        .disallowHardwareConfig() // hardware-битмапы на боксах могут зависать
+                        .listener(object : com.bumptech.glide.request.RequestListener<android.graphics.drawable.Drawable> {
+                            override fun onLoadFailed(e: GlideException?, model: Any?, target: com.bumptech.glide.request.target.Target<android.graphics.drawable.Drawable>, isFirstResource: Boolean): Boolean {
+                                StageLog.w("photo load failed: ${item.relPath} ${e?.message}")
+                                errorDelegate?.invoke(item)
+                                settle()
+                                return true
+                            }
+
+                            override fun onResourceReady(resource: android.graphics.drawable.Drawable, model: Any, target: com.bumptech.glide.request.target.Target<android.graphics.drawable.Drawable>, dataSource: com.bumptech.glide.load.DataSource, isFirstResource: Boolean): Boolean {
+                                settle()
+                                return false
+                            }
+                        })
+                        .into(img)
+                }
+            }
+        }
+        if (loaded == null) {
+            // таймаут: ни success, ни fail за 15с — транзиентный завис Glide.
+            // НЕ блэклистим: фото пропускается и ретраится на следующем обороте.
+            StageLog.w("photo load timeout: ${item.relPath} — пропуск слайда")
+            runCatching { Glide.with(appView.context).clear(img) }
+            return
+        }
         img.animate().alpha(1f).setDuration(if (crossfade) fadeMs else 1L).setListener(null).start()
         val prev = s.front
         s.swap()
         if (crossfade && prev !== img) {
             prev.animate().alpha(0f).setDuration(fadeMs * 2).setListener(null).start()
         }
+        StageLog.i("photo shown: ${item.relPath}")
     }
 
     private suspend fun awaitFirstFrame(p: Player) {
+        val deadline = System.currentTimeMillis() + FIRST_FRAME_TIMEOUT_MS
         while (p.playbackState != Player.STATE_READY && p.playbackState != Player.STATE_ENDED) {
             if (p.playerError != null || paused) return
+            if (System.currentTimeMillis() > deadline) {
+                // OMX может заклинить после серии стоп/стартов — READY не придёт никогда
+                throw java.io.IOException("first frame timeout (codec wedged)")
+            }
             delay(50)
         }
     }
@@ -785,7 +814,20 @@ class StagePlayer(
                 }
             }
             p.addListener(listener)
-            cont.invokeOnCancellation { p.removeListener(listener) }
+            // watchdog: OMX (AM3) может не выдать STATE_ENDED — конец по позиции
+            val watchdog = scope.launch {
+                while (isActive) {
+                    val dur = p.duration
+                    if (dur > 0 && p.currentPosition >= dur) {
+                        p.removeListener(listener)
+                        StageLog.w("run end by position watchdog: ${items.lastOrNull()?.relPath}")
+                        if (cont.isActive) cont.resume(items.lastOrNull())
+                        return@launch
+                    }
+                    delay(500)
+                }
+            }
+            cont.invokeOnCancellation { watchdog.cancel(); p.removeListener(listener) }
         }
     }
 

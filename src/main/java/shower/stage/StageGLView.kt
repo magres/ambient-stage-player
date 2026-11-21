@@ -109,10 +109,6 @@ class StageGLView @JvmOverloads constructor(
         StageLog.i("StageGL slot=$slot aspect=$sa buf=${stSize[0]}x${stSize[1]} rot=$rot mode=${rendererImpl.mode}")
     }
 
-    /** Пропорции/поворот видео активного слота (обратная совместимость). */
-    fun setVideoAspect(w: Int, h: Int, rotationDegrees: Int) =
-        setSlotAspect(rendererImpl.primary, w, h, rotationDegrees)
-
     /** Какой слот (0/1) рисуется непрозрачным основным пайплайном. */
     fun setActiveSlot(slot: Int) {
         val s = if (slot == 1) 1 else 0
@@ -130,9 +126,6 @@ class StageGLView @JvmOverloads constructor(
             requestRender()
         }
     }
-
-    /** Активный (основной) слот. */
-    fun activeSlot(): Int = rendererImpl.primary
 
     /** Был ли уже кадр в этом слоте (для ожидания перед стартом фейда). */
     fun slotHasFrame(slot: Int): Boolean =
